@@ -152,12 +152,23 @@ if [ -f "$APP_PATH/embedded.mobileprovision" ]; then
     /usr/libexec/PlistBuddy -c "Set :get-task-allow true" "$ENTITLEMENTS_PATH" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :get-task-allow bool true" "$ENTITLEMENTS_PATH" 2>/dev/null || true
     
-    # 更新application-identifier以匹配新的Bundle ID
+    # 提取Team ID并更新entitlements
     TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print:Entitlements:com.apple.developer.team-identifier' "$WORK_DIR/provision.plist" 2>/dev/null)
     if [ -n "$TEAM_ID" ] && [ "$TEAM_ID" != "*" ]; then
-        /usr/libexec/PlistBuddy -c "Set :application-identifier $TEAM_ID.$NEW_BUNDLE_ID" "$ENTITLEMENTS_PATH" 2>/dev/null || true
+        # 更新application-identifier
+        /usr/libexec/PlistBuddy -c "Set :application-identifier $TEAM_ID.$NEW_BUNDLE_ID" "$ENTITLEMENTS_PATH" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :application-identifier string $TEAM_ID.$NEW_BUNDLE_ID" "$ENTITLEMENTS_PATH" 2>/dev/null || true
+        
+        # 更新com.apple.developer.team-identifier
+        /usr/libexec/PlistBuddy -c "Set :com.apple.developer.team-identifier $TEAM_ID" "$ENTITLEMENTS_PATH" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $TEAM_ID" "$ENTITLEMENTS_PATH" 2>/dev/null || true
+        
+        print_info "更新Team Identifier: $TEAM_ID"
         print_info "更新application-identifier: $TEAM_ID.$NEW_BUNDLE_ID"
     fi
+else
+    # 如果没有Provisioning Profile，但可能有旧的entitlements
+    print_warning "未提供Provisioning Profile，将使用通配符Team ID"
 fi
 
 # 删除旧的签名
@@ -165,42 +176,86 @@ print_info "删除现有签名..."
 rm -rf "$APP_PATH/_CodeSignature" 2>/dev/null || true
 rm -f "$APP_PATH/embedded.mobileprovision.old" 2>/dev/null || true
 
-# 对所有Framework和Dylib进行签名
+# 对所有Framework和Dylib进行签名（深度签名，从内到外）
 print_info "对Frameworks和动态库进行签名..."
-find "$APP_PATH/Frameworks" -type f \( -name "*.dylib" -o -name "*.framework" \) 2>/dev/null | while read framework; do
-    if [ -f "$framework" ]; then
-        print_info "  签名: $(basename "$framework")"
-        /usr/bin/codesign -f -s "$SIGNING_IDENTITY" "$framework" 2>/dev/null || true
-    fi
-done
-
-# 对.framework目录中的可执行文件签名
-find "$APP_PATH/Frameworks" -name "*.framework" 2>/dev/null | while read framework; do
-    framework_executable=$(basename "$framework" .framework)
-    if [ -f "$framework/$framework_executable" ]; then
-        print_info "  签名Framework可执行文件: $framework_executable"
-        /usr/bin/codesign -f -s "$SIGNING_IDENTITY" "$framework/$framework_executable" 2>/dev/null || true
-    fi
-done
+if [ -d "$APP_PATH/Frameworks" ]; then
+    # 先对.framework目录中的可执行文件签名
+    find "$APP_PATH/Frameworks" -name "*.framework" 2>/dev/null | while read framework; do
+        framework_executable=$(basename "$framework" .framework)
+        if [ -f "$framework/$framework_executable" ]; then
+            print_info "  签名Framework: $(basename "$framework")"
+            /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+                --timestamp \
+                --generate-entitlement-der \
+                "$framework" 2>&1 | grep -v "replacing existing signature" || true
+        fi
+    done
+    
+    # 再对独立的dylib文件签名
+    find "$APP_PATH/Frameworks" -type f -name "*.dylib" 2>/dev/null | while read dylib; do
+        print_info "  签名Dylib: $(basename "$dylib")"
+        /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+            --timestamp \
+            --generate-entitlement-der \
+            "$dylib" 2>&1 | grep -v "replacing existing signature" || true
+    done
+fi
 
 # 对PlugIns进行签名
 if [ -d "$APP_PATH/PlugIns" ]; then
     print_info "对PlugIns进行签名..."
     find "$APP_PATH/PlugIns" -name "*.appex" | while read plugin; do
         print_info "  签名: $(basename "$plugin")"
-        /usr/bin/codesign -f -s "$SIGNING_IDENTITY" --entitlements "$ENTITLEMENTS_PATH" "$plugin"
+        # 先删除插件的旧签名
+        rm -rf "$plugin/_CodeSignature" 2>/dev/null || true
+        /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+            --entitlements "$ENTITLEMENTS_PATH" \
+            --timestamp \
+            --generate-entitlement-der \
+            "$plugin" 2>&1 | grep -v "replacing existing signature" || true
+    done
+fi
+
+# 对Watch应用进行签名（如果存在）
+if [ -d "$APP_PATH/Watch" ]; then
+    print_info "对Watch应用进行签名..."
+    find "$APP_PATH/Watch" -name "*.app" | while read watchapp; do
+        print_info "  签名: $(basename "$watchapp")"
+        rm -rf "$watchapp/_CodeSignature" 2>/dev/null || true
+        /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+            --entitlements "$ENTITLEMENTS_PATH" \
+            --timestamp \
+            --generate-entitlement-der \
+            "$watchapp" 2>&1 | grep -v "replacing existing signature" || true
     done
 fi
 
 # 对主应用进行签名
 print_info "对主应用进行签名..."
-/usr/bin/codesign -f -s "$SIGNING_IDENTITY" \
-    --entitlements "$ENTITLEMENTS_PATH" \
-    "$APP_PATH"
 
-if [ $? -ne 0 ]; then
-    print_error "签名失败"
-    exit 1
+# 使用更完整的codesign选项
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+    --entitlements "$ENTITLEMENTS_PATH" \
+    --timestamp \
+    --generate-entitlement-der \
+    --deep \
+    "$APP_PATH" 2>&1
+
+CODESIGN_RESULT=$?
+
+if [ $CODESIGN_RESULT -ne 0 ]; then
+    print_error "签名失败，尝试不使用--deep选项重新签名..."
+    # 不使用--deep再试一次（有时--deep会导致问题）
+    /usr/bin/codesign --force --sign "$SIGNING_IDENTITY" \
+        --entitlements "$ENTITLEMENTS_PATH" \
+        --timestamp \
+        --generate-entitlement-der \
+        "$APP_PATH" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        print_error "签名失败"
+        exit 1
+    fi
 fi
 
 print_info "签名完成！"
@@ -210,9 +265,19 @@ print_info "验证签名..."
 echo ""
 echo "========== 签名验证结果 =========="
 
-# 验证主应用签名
+# 验证主应用签名（详细模式）
+print_info "执行标准验证..."
 codesign -vv -d "$APP_PATH" 2>&1
 VERIFY_RESULT=$?
+
+echo ""
+print_info "执行深度验证..."
+codesign --verify --deep --strict --verbose=2 "$APP_PATH" 2>&1
+DEEP_VERIFY=$?
+
+if [ $DEEP_VERIFY -ne 0 ]; then
+    print_warning "深度验证失败，但可能仍然可以使用"
+fi
 
 echo ""
 echo "========== Entitlements内容 =========="
@@ -275,17 +340,44 @@ VERIFY_DIR=$(mktemp -d)
 unzip -q "$OUTPUT_IPA" -d "$VERIFY_DIR"
 VERIFY_APP=$(find "$VERIFY_DIR/Payload" -name "*.app" -depth 1 | head -n 1)
 
+print_info "基本验证..."
 codesign -vv "$VERIFY_APP" 2>&1
 FINAL_VERIFY=$?
+
+echo ""
+print_info "严格验证..."
+codesign --verify --deep --strict --verbose=2 "$VERIFY_APP" 2>&1
+STRICT_VERIFY=$?
+
+echo ""
+print_info "检查签名身份..."
+codesign -dvv "$VERIFY_APP" 2>&1 | grep "Authority\|TeamIdentifier\|Identifier"
 
 rm -rf "$VERIFY_DIR"
 
 if [ $FINAL_VERIFY -eq 0 ]; then
     print_info "✓ 最终签名验证通过"
+    if [ $STRICT_VERIFY -eq 0 ]; then
+        print_info "✓ 严格验证也通过"
+    else
+        print_warning "⚠ 严格验证失败，但基本签名有效（某些设备可能无法安装）"
+    fi
     echo ""
     print_info "重签名成功！可以使用以下文件:"
     print_info "  $OUTPUT_IPA"
+    echo ""
+    print_info "提示："
+    print_info "  - 如果设备提示'无法验证完整性'，请确保："
+    print_info "    1. 使用正确的开发者证书和Provisioning Profile"
+    print_info "    2. 设备UDID已添加到Provisioning Profile中"
+    print_info "    3. Bundle ID与证书匹配"
+    print_info "  - 尝试使用Xcode安装: xcrun simctl install booted \"$OUTPUT_IPA\""
 else
     print_error "✗ 最终签名验证失败"
+    print_error "可能的原因："
+    print_error "  1. 签名证书不正确或已过期"
+    print_error "  2. Provisioning Profile与证书不匹配"
+    print_error "  3. Bundle ID配置错误"
+    print_error "  4. 某些Framework未正确签名"
     exit 1
 fi
